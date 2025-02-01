@@ -5,6 +5,9 @@ import pygame
 from dataclasses import dataclass, field
 from typing import List, Callable, Optional
 from pygame.locals import *
+from decimal import Decimal
+from typing import Deque
+from collections import deque
 
 # Enhanced Constants
 SCREEN_SIZE = (1280, 720)
@@ -33,35 +36,40 @@ class ParticleType:
     base_production: float
     produces: str
     color: tuple
-    count: float = 0.0  # Changed to float for fractional values
+    count: float = 0.0
     upgrades: List[str] = field(default_factory=list)
     description: str = ""
     unlocked: bool = True
+    purchased_upgrades: List[str] = field(default_factory=list)  # Track which upgrades are actually purchased
 
-    def calculate_cost(self) -> float:
-        max_exponent = 1000  # Cap exponent to prevent overflow
+    def calculate_cost(self) -> Decimal:
+        max_exponent = 1000
         exponent = max_exponent if self.count > max_exponent else self.count
-        raw_cost = self.base_cost * (self.cost_growth ** exponent)
-        return round(raw_cost, 2)  # Round to 2 decimal places
-
-    def calculate_production_per_second(self, prestige_bonus: float) -> float:
-        # For beta particles, add a small base production even if count is 0
-        if self.name.lower() == "beta" and self.count == 0:
-            print("Beta is producing with a base rate!")
-            return 3.0 * prestige_bonus  # or 3.3 * prestige_bonus if you prefer
+        raw_cost = float(self.base_cost) * (float(self.cost_growth) ** exponent)
+        return Decimal(str(round(raw_cost, 2)))  # Convert to Decimal after calculation
     
-        if not self.upgrades:
-            return self.count * self.base_production * prestige_bonus
+    def calculate_production_per_second(self, prestige_bonus: Decimal) -> Decimal:
+    # Convert all values to Decimal for consistent calculation
+        count_decimal = Decimal(str(self.count))
+        base_production_decimal = Decimal(str(self.base_production))
+        prestige_bonus_decimal = Decimal(str(prestige_bonus))  # Convert prestige_bonus to Decimal
+    
+    # Calculate base production
+        base_production = count_decimal * base_production_decimal * prestige_bonus_decimal
+    
+    # Apply upgrade multipliers
+        production_multiplier = Decimal('1.0')
+        for upgrade_name in self.purchased_upgrades:
+        # Apply 5% increase per purchased upgrade
+            production_multiplier *= Decimal('1.05')
         
-        total_production = self.count * self.base_production * prestige_bonus
-        for upgrade_name in self.upgrades:
-        # Apply some growth logic here, based on the upgrade
-        # (For example, for each upgrade, increase production by a fixed percentage)
-            total_production *= 1.05  # This is just an example, adjust as needed
+        return base_production * production_multiplier
+    def add_purchased_upgrade(self, upgrade_name: str):
+        if upgrade_name not in self.purchased_upgrades:
+            self.purchased_upgrades.append(upgrade_name)
 
-        return total_production
     def to_dict(self) -> dict:
-        return {
+        data = {
             "name": self.name,
             "base_cost": self.base_cost,
             "cost_growth": self.cost_growth,
@@ -71,12 +79,14 @@ class ParticleType:
             "count": self.count,
             "upgrades": self.upgrades,
             "description": self.description,
-            "unlocked": self.unlocked
+            "unlocked": self.unlocked,
+            "purchased_upgrades": self.purchased_upgrades
         }
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "ParticleType":
-        return cls(
+        particle = cls(
             name=data["name"],
             base_cost=data["base_cost"],
             cost_growth=data["cost_growth"],
@@ -88,22 +98,35 @@ class ParticleType:
             description=data.get("description", ""),
             unlocked=data.get("unlocked", True)
         )
+        particle.purchased_upgrades = data.get("purchased_upgrades", [])
+        return particle
 
 @dataclass
 class Achievement:
-    name: str
-    description: str
-    condition: Callable[["GameState"], bool]
-    reward: float
-    unlocked: bool = False
+    def __init__(self, name: str, description: str, condition: Callable[["GameState"], bool], reward: float, unlocked: bool = False):
+        self.name = name
+        self.description = description
+        self.condition = condition
+        self.reward = Decimal(str(reward))  # 将 reward 转换为 Decimal 类型
+        self.unlocked = unlocked
 
     def to_dict(self) -> dict:
         return {
             "name": self.name,
             "description": self.description,
-            "reward": self.reward,
+            "reward": float(self.reward),  # 转换为浮点数
             "unlocked": self.unlocked
         }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> "Achievement":
+        return cls(
+            name=data["name"],
+            description=data["description"],
+            condition=lambda state: False,  # 需要根据实际情况实现条件
+            reward=Decimal(str(data["reward"])),
+            unlocked=data["unlocked"]
+        )
 
 @dataclass
 class Upgrade:
@@ -129,16 +152,16 @@ class Upgrade:
 
 class GameState:
     def __init__(self):
-        self.cash: float = 50.0
+        self.cash = Decimal('50.0')
         self.prestige_level: int = 0
-        self.prestige_bonus: float = 1.0
+        self.prestige_bonus: Decimal = Decimal('1.0')
         self.last_update: float = time.time()
-        self.total_earnings: float = 0.0
-        
+        self.total_earnings: Decimal = Decimal('0.0')
+        self.message_queue: Deque = deque(maxlen=10)
         self.init_particles()
         self.init_achievements()
         self.init_upgrades()
-
+        
     def init_particles(self):
         self.particles = {
             "alpha": ParticleType(
@@ -155,7 +178,7 @@ class GameState:
                 name="Beta",
                 base_cost=50,
                 cost_growth=1.2,
-                base_production=3.0,
+                base_production=0.0,  # Start with 0 base production
                 produces="beta",
                 color=BASE_COLORS["particle_beta"],
                 description="Generates Beta particles which boost Alpha production via upgrades.",
@@ -173,7 +196,46 @@ class GameState:
                 unlocked=False
             )
         }
+        
+    def apply_upgrade_effect(self, upgrade: Upgrade):
+        if upgrade.particle_requirement in self.particles:
+            particle = self.particles[upgrade.particle_requirement]
+            
+            # Add the upgrade to the particle's purchased upgrades list
+            particle.add_purchased_upgrade(upgrade.name)
+            
+            # Apply the specific upgrade effect
+            if upgrade.name == "Quantum Computing":
+                particle.base_production *= 2
+            elif upgrade.name == "Hyperspace Fabrication":
+                particle.base_production = 3.0  # Set initial production for Beta
+            elif upgrade.name == "Gamma Resonance":
+                particle.base_production *= 4
+            elif upgrade.name == "Beta Booster":
+                self.particles["alpha"].base_production *= 1.1
+            elif upgrade.name == "Gamma Booster":
+                self.particles["beta"].base_production *= 1.15
 
+    def process_upgrade_purchase(self, upgrade: Upgrade) -> bool:
+        if upgrade.unlocked:
+            return False
+
+        if upgrade.currency == 'cash':
+            if self.cash < upgrade.cost:
+                return False
+            self.cash -= upgrade.cost
+        else:
+            if upgrade.currency not in self.particles:
+                return False
+            particle = self.particles[upgrade.currency]
+            if particle.count < upgrade.cost:
+                return False
+            particle.count -= upgrade.cost
+
+        self.apply_upgrade_effect(upgrade)
+        upgrade.unlocked = True
+        return True
+    
     def init_achievements(self):
         self.achievements = [
             Achievement(
@@ -280,43 +342,47 @@ class GameState:
         if time_diff is None:
             time_diff = self.time_since_last_update()
             
-            total_cash_earned = 0.0
-            unlock_messages = []
+        total_cash_earned = Decimal('0.0')
+        unlock_messages = []
 
         for particle in self.particles.values():
             if not particle.unlocked:
                 continue
-            production_per_second = particle.calculate_production_per_second(self.prestige_bonus)
-            produced = production_per_second * time_diff
+                
+            # Convert production to Decimal
+            production_per_second = Decimal(str(particle.calculate_production_per_second(float(self.prestige_bonus))))
+            produced = production_per_second * Decimal(str(time_diff))
 
             if particle.produces == "cash":
                 self.cash += produced
                 total_cash_earned += produced
             else:
-                    if particle.produces in self.particles:
-                        self.particles[particle.produces].count += produced
-                        self.particles[particle.produces].count = round(self.particles[particle.produces].count, 2)  # Prevent runaway growth# Fixed this line
-                    else:
-                        print(f"Warning: Particle {particle.name} produces unknown type {particle.produces}")
+                if particle.produces in self.particles:
+                    # For non-cash resources, keep using floats
+                    float_produced = float(produced)
+                    self.particles[particle.produces].count += float_produced
+                    self.particles[particle.produces].count = round(self.particles[particle.produces].count, 2)
+                else:
+                    print(f"Warning: Particle {particle.name} produces unknown type {particle.produces}")
 
         self.total_earnings += total_cash_earned
         self.last_update = time.time()
 
-        if self.total_earnings >= 500 and not self.particles["beta"].unlocked:
+        # Check for unlocks based on total earnings
+        if float(self.total_earnings) >= 500 and not self.particles["beta"].unlocked:
             self.particles["beta"].unlocked = True
             unlock_messages.append("Beta particles unlocked! >>")
-            if self.total_earnings >= 5000 and not self.particles["gamma"].unlocked:
-                self.particles["gamma"].unlocked = True
+        if float(self.total_earnings) >= 5000 and not self.particles["gamma"].unlocked:
+            self.particles["gamma"].unlocked = True
             unlock_messages.append("Gamma particles unlocked! >>")
 
         return unlock_messages if unlock_messages else None
-    
 
     def perform_prestige(self) -> bool:
-        if self.cash >= 1000:
+        if self.cash >= Decimal('1000'):
             self.prestige_level += 1
-            self.prestige_bonus = 1 + 0.1 * self.prestige_level
-            self.cash = 0
+            self.prestige_bonus = Decimal('1.0') + Decimal('0.1') * Decimal(str(self.prestige_level))
+            self.cash = Decimal('0')
             for particle in self.particles.values():
                 particle.count = 0
             return True
@@ -369,66 +435,112 @@ class GameState:
 
     def to_dict(self) -> dict:
         return {
-            "cash": self.cash,
+            "cash": float(self.cash),
             "prestige_level": self.prestige_level,
-            "prestige_bonus": self.prestige_bonus,
+            "prestige_bonus": float(self.prestige_bonus),
             "last_update": self.last_update,
-            "total_earnings": self.total_earnings,
+            "total_earnings": float(self.total_earnings),
             "particles": {name: particle.to_dict() for name, particle in self.particles.items()},
             "upgrades": [upgrade.to_dict() for upgrade in self.upgrades],
             "booster_upgrades": [upgrade.to_dict() for upgrade in self.booster_upgrades],
             "achievements": [achievement.to_dict() for achievement in self.achievements]
         }
-
+    
     def save(self):
         try:
             data = self.to_dict()
             with open(SAVE_FILE, "w") as f:
-                json.dump(data, f)
+                json.dump(data, f, indent=4)
         except Exception as e:
             print(f"Save error: {e}")
-
+            
     def load(self):
         try:
-            if os.path.exists(SAVE_FILE):
-                with open(SAVE_FILE, "r") as f:
-                    data = json.load(f)
-                    
-                    self.cash = data.get("cash", 50.0)
-                    self.prestige_level = data.get("prestige_level", 0)
-                    self.prestige_bonus = data.get("prestige_bonus", 1.0)
-                    self.total_earnings = data.get("total_earnings", 0.0)
-                    self.last_update = time.time()
-                    
-                    particles_data = data.get("particles", {})
-                    self.particles = {
-                        name: ParticleType.from_dict(particle_data)
-                        for name, particle_data in particles_data.items()
-                    }
-                    
-                    upgrades_data = data.get("upgrades", [])
-                    for saved_upgrade in upgrades_data:
-                        for upgrade in self.upgrades:
-                            if upgrade.name == saved_upgrade["name"]:
-                                upgrade.unlocked = saved_upgrade["unlocked"]
-                                break
-                    booster_upgrades_data = data.get("booster_upgrades", [])
-                    for saved_upgrade in booster_upgrades_data:
-                        for upgrade in self.booster_upgrades:
-                            if upgrade.name == saved_upgrade["name"]:
-                                upgrade.unlocked = saved_upgrade["unlocked"]
-                                break
-                    
-                    achievements_data = data.get("achievements", [])
-                    for saved_achievement in achievements_data:
-                        for achievement in self.achievements:
-                            if achievement.name == saved_achievement["name"]:
-                                achievement.unlocked = saved_achievement["unlocked"]
-                                break
-                    self.ensure_default_particles()
+            if not os.path.exists(SAVE_FILE):
+                print("No save file found. Starting a new game.")
+                return
+
+            with open(SAVE_FILE, "r") as f:
+                data = json.load(f)
+
+                if not data or not isinstance(data, dict):
+                    print("Invalid save file data. Starting a new game.")
+                    return
+
+                self.cash = Decimal(str(data.get("cash", 50.0)))
+                self.prestige_level = data.get("prestige_level", 0)
+                self.prestige_bonus = Decimal(str(data.get("prestige_bonus", 1.0)))
+                self.total_earnings = Decimal(str(data.get("total_earnings", 0.0)))
+                self.last_update = time.time()
+
+                particles_data = data.get("particles", {})
+                self.particles = {
+                    name: ParticleType.from_dict(particle_data)
+                    for name, particle_data in particles_data.items()
+                }
+                self.ensure_default_particles()
+
+                self._load_upgrades(data.get("upgrades", []), self.upgrades)
+                self._load_upgrades(data.get("booster_upgrades", []), self.booster_upgrades)
+                self._load_achievements(data.get("achievements", []))
+        except json.JSONDecodeError as e:
+            print(f"Load error: Invalid JSON format: {e}")
         except Exception as e:
             print(f"Load error: {e}")
 
+    def _load_upgrades(self, saved_upgrades, upgrade_list):
+        for saved_upgrade in saved_upgrades:
+            for upgrade in upgrade_list:
+                if upgrade.name == saved_upgrade["name"]:
+                    upgrade.unlocked = saved_upgrade["unlocked"]
+                    break
+
+    def _load_achievements(self, saved_achievements):
+        for saved_achievement in saved_achievements:
+            for achievement in self.achievements:
+                if achievement.name == saved_achievement["name"]:
+                    achievement.unlocked = saved_achievement["unlocked"]
+                    break
+class GameEvent:
+    def __init__(self, event_type: str, data: dict):
+        self.type = event_type
+        self.data = data
+
+class EventManager:
+    def __init__(self):
+        self.listeners = defaultdict(list)
+    
+    def subscribe(self, event_type: str, callback: Callable):
+        self.listeners[event_type].append(callback)
+    
+    def emit(self, event: GameEvent):
+        for callback in self.listeners[event.type]:
+            callback(event.data)
+            
+class SaveManager:
+    def __init__(self, game_state: GameState):
+        self.game_state = game_state
+        self.auto_save_interval = 300  # 5 minutes
+        self._last_save = time.time()
+    
+    def auto_save(self):
+        if time.time() - self._last_save >= self.auto_save_interval:
+            self.save()
+            self._last_save = time.time()
+    
+    def save(self):
+        # Implement save file versioning
+        version = 1
+        save_data = {
+            'version': version,
+            'timestamp': time.time(),
+            'state': self.game_state.to_dict()
+        }
+        # Implement backup before saving
+        self._backup_save()
+        with open(SAVE_FILE, 'w') as f:
+            json.dump(save_data, f)            
+            
 class GameUI:
     def __init__(self, game_state: GameState):
         pygame.init()
